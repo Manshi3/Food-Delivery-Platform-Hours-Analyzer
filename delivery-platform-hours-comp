@@ -1,0 +1,110 @@
+WITH UberEatsModified_temp AS (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY slug ORDER BY timestamp DESC) AS record_order
+  FROM `arboreal-vision-339901.take_home_v2.virtual_kitchen_ubereats_hours`
+),
+UberEatsModified AS (
+  SELECT slug, response, b_name, vb_name
+  FROM UberEatsModified_temp
+  WHERE record_order = 1
+),
+temp1 AS(
+  SELECT slug, response, b_name, vb_name, CAST(JSON_EXTRACT_SCALAR(mm, '$.menuUUID') AS string) as menuUUID
+  FROM UberEatsModified,
+  UNNEST(JSON_EXTRACT_ARRAY(response, '$.data.menuMapping')) AS mm
+),
+temp2 AS (
+  SELECT
+    slug, b_name, vb_name,
+    CAST(concat(CAST(JSON_EXTRACT_SCALAR(JSON_QUERY(response, '$.data.menus')[temp1.menuUUID], '$.sections[0].regularHours[0].startTime') AS string), ':00') AS time) AS start_time,
+    CAST(concat(CAST(JSON_EXTRACT_SCALAR(JSON_QUERY(response, '$.data.menus')[temp1.menuUUID], '$.sections[0].regularHours[0].endTime') AS string), ':00') AS time) AS end_time,
+    JSON_EXTRACT_ARRAY(JSON_QUERY(response, '$.data.menus')[temp1.menuUUID], '$.sections[0].regularHours[0].daysBitArray') AS days_bit_array
+  FROM
+    temp1
+),
+UberEats_final AS (
+  SELECT
+    slug,
+    b_name,
+    vb_name,
+    start_time,
+    end_time,
+    day_index,
+    CASE day_index
+      WHEN 0 THEN 'MONDAY'
+      WHEN 1 THEN 'TUESDAY'
+      WHEN 2 THEN 'WEDNESDAY'
+      WHEN 3 THEN 'THURSDAY'
+      WHEN 4 THEN 'FRIDAY'
+      WHEN 5 THEN 'SATURDAY'
+      WHEN 6 THEN 'SUNDAY'
+    END AS day
+  FROM (
+    SELECT
+      slug,
+      b_name,
+      vb_name,
+      start_time,
+      end_time,
+      day_index,
+      BOOL(days_bit_array[day_index]) AS is_open
+    FROM
+      temp2,
+      UNNEST(GENERATE_ARRAY(0, 6)) AS day_index
+  )
+  WHERE is_open = true
+),
+GrubHubModified_temp AS (
+  SELECT *,
+    ROW_NUMBER() OVER (PARTITION BY slug ORDER BY timestamp DESC) AS record_order
+  FROM `arboreal-vision-339901.take_home_v2.virtual_kitchen_grubhub_hours`
+),
+GrubHubModified AS (
+  SELECT slug, response, b_name, vb_name
+  FROM GrubHubModified_temp
+  WHERE record_order = 1
+),
+GrubHub_final AS (
+  SELECT
+    slug, b_name, vb_name,
+    CAST(JSON_EXTRACT_SCALAR(value, '$.days_of_week[0]') AS string) AS day,
+    CAST(JSON_EXTRACT_SCALAR(value, '$.from') AS time) AS open_time,    
+    CAST(JSON_EXTRACT_SCALAR(value, '$.to') AS time) AS close_time
+  FROM GrubHubModified,
+  UNNEST(JSON_EXTRACT_ARRAY(response, '$.availability_by_catalog.STANDARD_DELIVERY.schedule_rules')) AS value
+),
+business_hours_comparison AS (
+  SELECT
+    gh.slug as `Grubhub slug`,
+    ue.slug as `Uber Eats slug`,
+    ue.day,
+    ue.start_time AS ue_open_time,
+    ue.end_time AS ue_close_time,
+    gh.open_time AS gh_open_time,
+    gh.close_time AS gh_close_time,
+    CASE
+      WHEN gh.open_time >= ue.start_time AND gh.close_time <= ue.end_time THEN 'In Range'
+      WHEN (CAST(CONCAT('1970-01-01 ', gh.open_time) AS DATETIME) BETWEEN TIMESTAMP_SUB(CAST(CONCAT('1970-01-01 ', ue.start_time) AS DATETIME), INTERVAL 5 MINUTE) AND CAST(CONCAT('1970-01-01 ', ue.start_time) AS DATETIME))
+        OR (CAST(CONCAT('1970-01-01 ', gh.close_time) AS DATETIME) BETWEEN CAST(CONCAT('1970-01-01 ', ue.end_time) AS DATETIME) AND TIMESTAMP_ADD(CAST(CONCAT('1970-01-01 ', ue.end_time) AS DATETIME), INTERVAL 5 MINUTE)) THEN 'Out of Range with 5 mins difference'
+      ELSE 'Out of Range'
+    END AS is_out_of_range
+  FROM
+    UberEats_final ue
+  JOIN
+    GrubHub_final gh ON ue.b_name = gh.b_name AND ue.vb_name = gh.vb_name AND ue.day = gh.day
+),
+business_hours_comparison_final AS (
+  SELECT DISTINCT * FROM business_hours_comparison
+)
+SELECT
+  `Grubhub Slug`,
+  CONCAT(CAST(gh_open_time AS STRING),'-',CAST(gh_close_time AS STRING)) AS `Virtual Restuarant Business Hours`,
+  `Uber Eats slug`,
+  CONCAT(CAST(ue_open_time AS STRING),'-',CAST(ue_close_time AS STRING)) AS `Uber Eats Business Hours`,
+  day,
+  is_out_of_range
+FROM
+  business_hours_comparison_final
+ORDER BY `Grubhub Slug` asc,
+`Uber Eats slug` asc,
+day asc;
